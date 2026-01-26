@@ -1,0 +1,805 @@
+---
+title: "Testing Different Specifications for Prediction"
+author: "Juan Espinosa"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+### Program Overview
+
+This R script is designed to test different specifications for predicting loan origination outcomes, based on the Home Mortgage Disclosure Act (HMDA) dataset. The goal is to predict the probability of loan origination in the US, focusing on factors like interest rate, debt-to-income ratio, and property value, among others. The analysis also includes model evaluation using performance metrics such as accuracy, AUC, and confusion matrices.
+
+------------------------------------------------------------------------
+
+# 1. Clear Environment and Load Libraries
+
+```{r}
+
+rm(list = ls()) 
+
+ 
+
+packages = c("base64enc","speedglm", "tidyverse", "dplyr","janitor","data.table",
+             "openxlsx", "ggplot2", "reshape2","summarytools", "pdftools",  "broom",
+             "lmtest","glmnet","margins","doMC","pROC","caret" ,"statar" )
+
+# lapply(packages, install.packages, character.only = TRUE)
+lapply(packages, library, character.only = TRUE)
+cat("\014")  
+
+#Number of Cores for paralell computing  
+registerDoMC(cores =detectCores()-2)
+path <- "G:/My Drive/Projects/Feature Choice"
+input <- paste(path,"/input",sep="/" )
+output <- paste(path,"/output",sep="/" )
+
+source(paste0(path,"/code/stat_binscatter.R"))
+```
+
+# 2. Load and Clean Data
+
+The **HMDA (Home Mortgage Disclosure Act) Public Loan Application Registry (LAR)** dataset is a comprehensive collection of data on mortgage applications in the United States, maintained by the **Consumer Financial Protection Bureau (CFPB)**. It includes information from lenders about loan applications, including whether loans were approved, denied, or withdrawn, as well as demographic details about the applicants. The data aims to provide transparency into lending practices, especially with respect to how loans are made to different racial, ethnic, and income groups.
+
+Key elements of the LAR dataset include:
+
+-   **Loan characteristics**: Loan amount, interest rate, loan purpose, property type, and whether the loan is conforming or non-conforming.
+
+-   **Applicant information**: Demographic data such as race, ethnicity, gender, income, and age.
+
+-   **Geographic data**: Location of the property, including metropolitan statistical area (MSA) and census tract.
+
+-   **Action taken**: Outcome of the loan application (e.g., approved, denied, withdrawn).
+
+-   **Credit characteristics**: Information on credit scores, debt-to-income ratio, and other risk factors.
+
+This dataset is used for research, policy analysis, and regulatory monitoring to ensure fair lending practices and assess patterns in access to credit across different communities, and is available at an annual frequency. The data is available for download [here](https://s3.amazonaws.com/cfpb-hmda-public/prod/snapshot-data/2024/2024_public_lar_csv.zip "HMDA Data"), and the full data field descriptions are available [here](https://ffiec.cfpb.gov/documentation/publications/loan-level-datasets/lar-data-fields "HMDA Data Fields").
+
+For this exercise, I use data for 2024 in the entire US with the goal to estimate a model that predicts the probability of a loan originating in the USA based on different features. In this project, I focus on Single Family, first lien mortgages in the entire USA. The dependent variable is the application status, which includes the following categories:
+
+-   1 - Loan originated.
+
+-   2 - Application approved but not accepted.
+
+-   3 - Application denied
+
+-   4 - Application withdrawn by applicant.
+
+-   5 - File closed for incompleteness.
+
+-   6 - Purchased loan.
+
+-   7 - Pre-approval request denied.
+
+-   8 - Pre-approval request approved but not accepted
+
+I classify a loan as "originated" if it falls under category 1, and 0 otherwise. Also, I perform some data cleaning steps to guarantee better quality data to use in the model:
+
+-   First, I determine if the application had a co-applicant based on their credit score field. if *co_applicant_credit_score_type*=10, then I conclude that the application had no co-applicant.
+
+-   The *purpose* variable is assigned two values based on the data dictionary: "Purchase" (if *purpose =* 1) or "Refinancing" (if *purpose =* 31) .
+
+-   I focus on family (non-commercial) properties only. Therefore, I keep applications where *business_or_commercial_purpose==*2 according to the data dictionary.
+
+-   I also keep loans where its possible to determine whether they are conforming or non conforming [GSE loans](https://www.businessinsider.com/personal-finance/mortgages/gse-mortgage). I keep these loans because lenders have strong incentives to originate GSE conforming loans, as these loans comply with a defined set of underwriting guidelines set the the U.S Government.
+
+-   I also keep loans with complete information, such as interest rate, property value and applicant income
+
+-   Finally, I exclude reverse mortgages and exempt loans.
+
+I also winsorize at 99% (only upper bound) quantitative variables prone to outliers, such as loan amount, income, property value, and loan to value ratios.
+
+```{r}
+ 
+data_file <- paste(input,"2024_public_lar_csv.csv", sep = "/") 
+
+hmda_data <- fread(data_file)  %>% clean_names()  
+str(hmda_data)
+
+hmda_data_subset <- hmda_data %>% filter(
+          grepl("Single Family",
+          derived_dwelling_category,ignore.case = FALSE), 
+          #state_code=="CA" ,
+          derived_loan_product_type=="Conventional:First Lien",
+          action_taken!=6 ,
+          loan_purpose %in% c(1,31) ,
+          conforming_loan_limit %in% c("C","NC"),
+          !is.na(income) ,
+          !is.na(property_value),
+          !is.na(interest_rate),
+          business_or_commercial_purpose==2,
+          reverse_mortgage==2,
+          debt_to_income_ratio !="Exempt",
+          ffiec_msa_md_median_family_income!=0,
+          applicant_age != "8888"
+                           ) %>% 
+          #Generate output variable for logistic regression
+          mutate(originated      = as.integer(
+                                   case_when(action_taken %in% 1~ 1,
+                                          action_taken %in% c(2,3,4,5,7,8) ~ 0,
+                                                TRUE ~ NA_real_)), 
+                 co_applicant    = ifelse(co_applicant_credit_score_type==10,0,1),
+                 purpose         = case_when( loan_purpose == 1 ~ "Purchase",
+                                              loan_purpose == 31 ~ "Refinance" ),
+                preapproval_req  = case_when( preapproval == 1 ~ "Requested",
+                                              preapproval == 2 ~ "Not Requested" )
+                             ) %>% 
+                      rename(age="applicant_age") %>%
+                    #Drop variables that wont be used
+                     select(-derived_dwelling_category,
+                            -state_code,
+                            derived_loan_product_type,
+                            -balloon_payment,
+                            interest_only_payment,
+                            -other_nonamortizing_features,
+                            -submission_of_application,
+                            -prepayment_penalty_term,
+                            -intro_rate_period,
+                            -applicant_age_above_62,
+                            -initially_payable_to_institution,
+                            -negative_amortization,
+                            -multifamily_affordable_units,
+                            -business_or_commercial_purpose,
+                            -starts_with("co_applicant"),-starts_with("applicant"),
+                            -matches("aus_[1-5]"),
+                            -ends_with("credit_score_type"),
+                            -matches("denial_reason_[1-5]")) 
+
+#Lets create  features to include on the logistic regression
+
+hmda_data_analysis <- hmda_data_subset %>% 
+  #Winsorize upper bound for quantitative variables.
+        mutate( 
+         loan_term                    = as.numeric(loan_term),
+         interest_rate                = as.numeric(interest_rate),
+         loan_amount                  = winsorize(
+                                        as.numeric(loan_amount),
+                                        probs = c(NA, 0.99)),
+         total_units                  = as.numeric(total_units),
+         property_value               = winsorize(
+                                        as.numeric(property_value), 
+                                        probs = c(NA, 0.99)),
+         combined_loan_to_value_ratio = winsorize(loan_amount/property_value,
+                                        probs = c(NA, 0.99)),
+         rate_spread                  = as.numeric(rate_spread),
+         income                       = winsorize(income*1000,
+                                        probs = c(NA, 0.99)), 
+         #Income is in thousands USD
+         lloan                        = log1p(loan_amount),
+         lincome                      = log1p(income),
+         lproperty_value              = log1p(property_value),
+         income_loan_ratio            = income/loan_amount,
+         income_prop_ratio            = income/property_value,
+         rel_income                   = income  /ffiec_msa_md_median_family_income,
+         age                          = factor(age),
+         derived_race                 = factor(derived_race),
+         derived_ethnicity            = factor(derived_ethnicity),
+         derived_sex                  = factor(derived_sex),
+         conforming_loan_limit        = factor(conforming_loan_limit),
+         preapproval_req              = factor(preapproval_req) ,
+         hoepa_status                 = factor(hoepa_status) ,
+         purpose                      = factor(purpose),
+         debt_to_income_ratio         = factor(debt_to_income_ratio ),
+         derived_msa_md               = factor(derived_msa_md) 
+                                                  )
+ 
+#Drop datasets to save memory
+rm(hmda_data)
+gc()
+
+vars_use     <-  c("originated", "derived_ethnicity","derived_race", "derived_sex",
+                   "conforming_loan_limit", "preapproval_req", "hoepa_status",
+                   "purpose", "debt_to_income_ratio","combined_loan_to_value_ratio",
+                   "interest_rate", "rate_spread", "age", "loan_term",
+                   "total_units",  "tract_population",
+                   "tract_minority_population_percent",
+                   "tract_to_msa_income_percentage", "tract_owner_occupied_units",
+                   "tract_one_to_four_family_homes",
+                   "property_value","income",
+                   "tract_median_age_of_housing_units",  "lloan", "lincome", 
+                   "lproperty_value",  "income_loan_ratio","income_prop_ratio",
+                   "rel_income" ,"derived_msa_md" 
+)
+
+reg_data <- hmda_data_analysis  %>% select(all_of(vars_use)) %>% filter(complete.cases(.)) 
+```
+
+# 3. Descriptive Plots
+
+Here, I plot some visuals to check whether there is relationship between the mortgage action and some of the features. Before diving in, I create a summary table for all the variables, which allows me to see if there are outliers (after Winsorizing) and provides me with an idea of how the data loo
+
+```{r}
+dfSummary(reg_data)
+```
+
+Now, lets turn to the plots. I selected some examples that show some interesting patterns:
+
+1.  **Property Value and Originations:** this plot shows the relationsuip between property values and the origination decision. Altough the data between originated and not originated is evenly distributed across property values, the scatter-plot shows that for properties above \$1.8 million, there is a higher concentration in originated mortgages, relative to non-originated mortgages. This is likely because rich customers purchase the most expensive homes.
+
+2.  **Income and Originations:** this plot shows that applicants earning more than \$500,000 are more likely than not to have a mortgage originated.
+
+3.  **Loan to Value Ratio and Originations**: this plot shows the relationship between loan to value ratio and origination. In principle, this plot shows how common is for a mortgage to be originated as the loan size relative to the property value changes. The closer this value is to 1, the largest share of the property value will be financed by the requested mortgage. As expected, the plot shows a lower mass of denied origination when loan to value ratios are lower than 20% (0.2).
+
+In all instances, I add the *geom_jitter( )* option to the scatter-plots so I can see the distribution values across the entire sample.
+
+```{r}
+p1 <-ggplot(reg_data, aes(x=property_value/1e06 ,y = originated)) +    
+  geom_jitter(  )+   
+  labs(  title = "Property Value vs Originations",  x = "Property Value (Million $)",y = "Origination") + 
+  theme_bw()+
+  theme( plot.title = element_text(size = 12, face = "bold", hjust = 0.5), 
+         # remove the vertical and horizontal grid lines
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor.x = element_blank(),
+         panel.grid.major.y = element_blank(),
+         panel.grid.minor.y = element_blank(),
+         legend.position="bottom") + 
+  guides(color=guide_legend(nrow=1, byrow=TRUE))+
+  scale_x_continuous( n.breaks=15  ) 
+
+p2 <-ggplot(reg_data, aes(x=income/1000 ,y = originated)) +    
+  geom_jitter(  )+   
+  labs(  title = "Income vs Originations",  x = "Income (Thousands $)",y = "Origination") + 
+  theme_bw()+
+  theme( plot.title = element_text(size = 12, face = "bold", hjust = 0.5), 
+         # remove the vertical and horizontal grid lines
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor.x = element_blank(),
+         panel.grid.major.y = element_blank(),
+         panel.grid.minor.y = element_blank(),
+         legend.position="bottom") + 
+  guides(color=guide_legend(nrow=1, byrow=TRUE))+
+  scale_x_continuous( n.breaks=15  ) 
+
+p3 <-ggplot(reg_data, aes(x=combined_loan_to_value_ratio,y = originated)) +    
+  geom_jitter(  )+   
+  labs(  title = "Loan To Value Ratio vs Originations",  x = "Loan To Value Ratio ",y = "Origination") + 
+  theme_bw()+
+  theme( plot.title = element_text(size = 12, face = "bold", hjust = 0.5), 
+         # remove the vertical and horizontal grid lines
+         panel.grid.major.x = element_blank(),
+         panel.grid.minor.x = element_blank(),
+         panel.grid.major.y = element_blank(),
+         panel.grid.minor.y = element_blank(),
+         legend.position="bottom") + 
+  guides(color=guide_legend(nrow=1, byrow=TRUE))+
+  scale_x_continuous( n.breaks=15  ) 
+
+print(p1)
+print(p2)
+print(p3)
+```
+
+# 4. Running a Baseline Logit regression
+
+This is the baseline logit regression where I include all of the features. This code prepares training and testing samples for a k-fold cross validation, handles class imbalance by weighting observations, and then estimates a logistic regression with a full set of predictors. Here are some considerations that go into defining the model:
+
+1.  **Set a seed** to guarantee that any random sampling generates the same result each time the script is run. This ensures that the model is replicable across exercises.
+
+2.  **Split the data into training and testing sets**. Given a seed, the dataset is randomly divided into 80% training and 20% testing, as it is common practice. The training set is used to estimate ("train") the model, while the test set will later be used for out-of-sample prediction accuracy.
+
+3.  **Create10 K-folds for cross validation**. A K-fold cross-validation is a method to evaluate a model's performance by splitting the data into K equal parts (folds). The idea is to train the model on K-1 folds and test it on the remaining fold, repeating the process for each of the K folds, so each fold serves as the test set once. Then, I average the model results from each fold to provide a more reliable estimate of the model's performance. This helps reduce bias and assess how well the model generalizes to new data.
+
+4.  **Addressing Class Imbalance.** As it can be seen in the summary section, the HMDA data shows that most applications are originated, so the dependent variable is highly imbalanced, which may create biased in the model where it over-predicts the origination class. To improve the model’s ability to discriminate between originated vs. non-originated applications, I weight the observations in a way such that observations in the minority class receive higher weight, and those in the majority class receive lower weight. Although it may not eliminate the bias completely, it can help in addressing this bias partially.
+
+Taking these considerations into account, I then proceed to estimate the baseline model. The binary nature of the *origination* variable is appropriate **logistic regression,** a commonly applied statistical framework. This model describes the relationship between the co-variates (or features) $x_i$ and the probability of an outcome $y_i$ as
+
+$$
+P\{Y = 1 \mid X\} = F\left(\beta_0 + \sum_{k=1}^K x_{ik}\beta_k\right)
+$$
+
+where, in the case of logistic regression,
+
+$$
+F(z) = \frac{e^{z}}{1 + e^{z}}, \quad \text{with } z = \beta_0 + \sum_{k=1}^K x_{ik}\beta_k.
+$$
+
+One quirk of this framework is that the relationship between the predictors and the probability is nonlinear, so the coefficients cannot be directly interpreted as the impact of a particular feature on the dependent variable (origination). In fact, the marginal effect depends on the values taken by each feature. Specifically, the marginal effect of variable $x_l$ is:
+
+$$
+\frac{\partial P\{Y = 1 \mid X\}}{\partial x_l}
+  = f\left(\beta_0 + \sum_{k=1}^K x_{ik}\beta_k\right)\beta_l,
+$$
+
+where the logistic density function is
+
+$$
+f(z) = \frac{e^{z}}{(1 + e^{z})^2}.
+$$
+
+This shows that, although the coefficient cannot be directly be interpreted, it informs the direction of the feature impact on origination. Using this framework, I estimate a logit regression and summarize the results. The baseline logistic regression model includes the following selected features:
+
+-   Loan pricing variables: interest rate, rate spread.
+
+-   Loan contract terms: loan_term, total_units, CLTV.
+
+-   Income and property controls: log loan amount, log income, log property value.
+
+-   Relative ratios: income-to-loan, income-to-property, relative income.
+
+-   Applicant characteristics: age.
+
+-   Loan classification and process variables: conforming limit status, pre-approval, purpose, DTI ratio.
+
+The model is estimated using the logistic link function, which is appropriate when predicting a binary outcome such as loan origination.
+
+```{r}
+#seed
+set.seed(100)
+#split model into Train and test set
+split     <- 0.8
+idxt      <- sample(nrow(reg_data), floor(nrow(reg_data)*split)  )
+ 
+train_set <- reg_data[idxt,]
+test_set  <- reg_data[-idxt,]
+
+y_train   <- train_set$originated
+ 
+y_test    <- test_set$originated
+
+#create k-folds for model evaluation
+kfolds    <- 10
+train_set <- train_set %>% mutate(folds= sample(rep(1:kfolds, length.out = nrow(train_set))))
+ 
+#Notice that there is high imbalance of origination. To circumvent this, we wan weight the regression observations 
+#to improve the model accuracy 
+ 
+class_counts <- table(train_set$originated)
+print(class_counts)
+ 
+w_reg     <- ifelse(train_set$originated == 1,
+                           class_counts[2]/sum(class_counts),
+                           class_counts[1]/sum(class_counts))
+
+
+model1 <- glm(originated ~  interest_rate + rate_spread + loan_term + 
+                            total_units  +    combined_loan_to_value_ratio +
+                            lloan+ lincome +lproperty_value +income_loan_ratio + income_prop_ratio +
+                            rel_income +
+                           age + # derived_sex + derived_race + derived_ethnicity+
+                            conforming_loan_limit  +  preapproval_req   +
+                            purpose  +   debt_to_income_ratio    , 
+                            data = train_set,
+                            family = binomial(link="logit"),
+                            weights = w_reg )
+summary(model1)
+```
+
+As explained above, although the coefficients are not fully indicative of the effect of the feature on originations (under no endogeneity), the coefficient sign is still informative of the direction of the feature's predictive capability of the dependent variable (origination). Below, I interpret the coefficient sins for some of these features:
+
+1.  **interest_rate:** Higher interest rates *reduce* the probability that a mortgage is originated. The effect is also significant at the 5% significance level.
+
+2.  **rate_spread:** This variable measures the difference between the covered loan’s annual percentage rate (APR) and the average prime offer rate (APOR) for a comparable transaction. The negative and statistically significant sign showsthat the an *increase* of this rate spread results in a *less* likely approval.
+
+3.  **loan_term: +0.00197 \*\*\***
+
+    Longer-term loans (30-year vs 15-year) very slightly increase origination odds.\
+    The effect is **small**, but statistically significant.
+
+4.  **combined_loan_to_value_ratio:** Higher loan to value ratio *tends* to reduce origination likelihood, but it is **not statistically significant** .
+
+5.  **income_loan_ratio:** A higher household income relative to loan amount predict that origination is *more likely*.
+
+6.  **income_prop_ratio:** Higher income relative to property value *raises* origination probability.
+
+7.  **rel_income:** Applicants earning more than area median show a small *decrease* in odds. Given the multiple income variables included, this may be contaminated by multicolinearity. To deal with this, I will test multiple specifications in the later sections
+
+8.  **Age variables:** the base category is **age 18–24** and all significant age coefficients are *negative,* meaning older applicants are less likely to be originated, all else constant. These results fit the pattern lenders may perceive higher long-term risk or lower loan profitability for older applicants.
+
+9.  **conforming_loan_limitNC:** Being non-conforming reduces origination probability.\
+    This is expected because conforming loans are easier to sell/securitize and non-conforming loans carry higher underwriting frictions.
+
+10. **preapproval_reqRequested:** Applicants who requested a pre-approval have *lower* origination probability. This reflects that many pre-approval requests never convert and that borrowers likely shop for rates.
+
+11. **purposeRefinance:** Refinance loans are *less likely* to be originated relative to purchase loans. This is consistent with higher documentation hurdles required to refinance a property, higher rate-trigger sensitivity, and potential borrower attrition during refinancing process.
+
+# 5. Evaluating Logit Model prediction performance.
+
+I create a custom function, `performance_measures()`, which will later be used in the cross-validation exercises. This function computes several commonly used evaluation metrics for my logistic regressions. The goal is to have a unified tool that assesses both **in-sample** and **out-of-sample** predictive performance. The function returns a comparison table, listing each of the following measures:
+
+1.  **Threshold:** This is the cutoff value used to classify predicted probabilities into classes:\
+    -   If `P(Y=1 | X) > threshold`, predict **1**\
+    -   Otherwise, predict **0**
+
+Different thresholds change the trade off between sensitivity and specificity.
+
+2.  **Sensitivity** (True Positive Rate): this metric calculates how well the model identifies actual positives.
+
+    $$ \text{Sensitivity} = \frac{\text{True Positives}}{\text{True Positives + False Negatives}} $$
+
+    In practical terms, Sensitivity answers this question: *Of all actual positive cases, how many did the model correctly identify?*
+
+3.  **Specificity** (True Negative Rate): this metric calculates how well the model identifies actual negatives.
+
+    $$ \text{Specificity} = \frac{\text{True Negatives}}{\text{True Negatives + False Positives}} $$
+
+    Similar to Sensitivity, Specificity answers this question: *Of all actual negative cases, how many did the model correctly classify?*
+
+4.  **Accuracy:** This metric calculates the fraction of all predictions that the model got correct.
+
+$$ \text{Accuracy} = \frac{\text{True Positives + True Negatives}}{\text{Total Observations}} $$
+
+Although helpful, it can be misleading as it can grow substantially if the outcome variable is imbalanced.
+
+5.  **Class Error:** This metric is the complement of accuracy and represents the proportion of incorrect predictions.
+
+    $$ \text{Class Error} = 1 - \text{Accuracy} $$
+
+Separately, I also include the ROC curve in the function. the ROC curve depicts the trade-off between true and false positive rates predicted by different thresholds against those delivered by a random number generator. Consequently, the further away the model's ROC curve from a 45 degree line, the better it will be at predicting mortgage origination. This trade-off can be summarized by calculating the **Area Under the ROC Curve (AUC)**. By design, the random-number generator produces an area of 0.5, so any value higher than that is indicative of a better fit, up to an area of 1, where the fit is perfect. Therefore, the AUC measures overall discrimination ability of the model.
+
+I declare the function and run all of these measures (in-sample) for the baseline model below:
+
+```{r}
+performance_measures <- function (model, y,pred_data=NULL,threshold=0.5){
+  #Calculate performance Measures: accuracy, specificity, sensitivity, confusion matrix, 
+  #ROC, AUC, and optimal threshold
+  #Inputs:
+  #model: a glm  or cv.glmnet object
+  #y: dependent variables used to evaluate fit.
+  #pred_data: prediction x variables if doing an out of sample check (if NULL, in-sample measures are used for glm)
+  #if using a cv.glmnet object, this argument should always be provided using the output of the model.matrix() call
+  #threshold: threshold used to classify y=1. Default to 0.5
+  
+  if(class(model)[1]=="cv.glmnet"){
+    if (is.null(pred_data)) stop("pred_data (x-matrix) is necessary for glmnet models.")
+    
+    probs <- as.numeric(predict(model, newx = pred_data, 
+                                type = "response", s = model$lambda.min
+    )
+    )
+    
+  }else if (class(model)[1]=="glm"){
+    
+    if(is.null(pred_data)){
+      probs       <- predict(model, type = "response")
+    }else{
+      probs       <- predict(model, pred_data, type = "response") 
+    }
+  } else{
+    stop("Function only handles glm or cv.glmnet models")
+  }
+  
+  preds       <- factor(ifelse(probs > 0.5, 1, 0), levels = c(0,1))
+  yvar        <- factor(y, levels = c(0,1)) 
+  # Accuracy  confusion matrix
+  accuracy    <- mean(preds == yvar)
+  classerror  <-  1- accuracy
+  Confmat     <- confusionMatrix(yvar, preds, positive="1")
+  #roc  
+  roc_obj     <- roc(response = yvar, predictor = probs)
+  
+  coords          <- coords(roc_obj,threshold, ret = c("threshold", 
+                                                       "sensitivity", "specificity") )
+  optimal_coords  <- coords(roc_obj, "best", ret = c("threshold", 
+                                                     "sensitivity", "specificity"), 
+                            best.method = "youden")
+  
+  # Accuracy + confusion matrix under optimal threshold
+  preds_optim       <-  factor(ifelse(probs > optimal_coords$threshold,1,0), 
+                               levels = c(0,1))
+  accuracy_optim    <- mean(preds_optim == yvar)
+  classerror_optim  <-  1- accuracy_optim
+  Confmat_optim     <- confusionMatrix(yvar, preds_optim, positive="1")
+  
+  #put comparison table together
+  comparison           <- rbind(c(coords,accuracy,classerror),
+                           c(optimal_coords,accuracy_optim,
+                             classerror_optim))
+  
+  rownames(comparison) <- c("Baseline","Optimal")
+  colnames(comparison) <- c("Threshold","Sensitivity",
+                            "Specificity","Accuracy","Class_Error")
+  
+  results           <- list(roc      = roc_obj,
+                            yhat     = probs,
+                            baseline = list(y_preds           = preds,
+                                            accuracy          = accuracy,
+                                            classerror        = classerror,
+                                            confusion_matrix  = Confmat,
+                                            performance       = coords),
+                            
+                            optimal   = list(y_preds          = preds_optim,
+                                            accuracy          = accuracy_optim,
+                                            classerror        = classerror_optim,
+                                            confusion_matrix  = Confmat_optim,
+                                            performance       = optimal_coords),
+                            
+                            comparison = comparison
+                            
+                            )
+return(results)
+}
+
+performance <- performance_measures(model=model1,y=y_train )
+
+#print auc
+performance$roc$auc 
+#Print confusion matrices
+performance$baseline$confusion_matrix$table
+
+performance$optimal$confusion_matrix$table
+#Print Comparison
+performance$comparison
+```
+
+The results above show that the model does a better job as classifying origination (Sensitivity) than denials (Specificity). This is not surprising given the sample imbalance discussed above. Moreover, the optimal threshold is 99% which gives an increase in Specificity of about 51% at a 16.3 percentage point cost in Sensitivity.
+
+# 6. Cross Validation and Model Choice.
+
+The baseline model include includes a selection of variables. When working with many predictors (especially when some are correlated) it becomes easy for a model to **over-fit**. Over-fitting occurs when a model captures noise or idiosyncrasies in the training data rather than the true underlying patterns. An over-fit model performs extremely well on the training set but poorly on new, unseen data, which defeats the purpose of prediction. In this section, I implement two methods for model choice: using regularization techniques, and by choosing between different candidate specifications.
+
+## 6.1 Using Regularization (Ridge and Lasso)
+
+To improve model performance and prevent over fitting, I estimate lasso and ridge models. Both techniques apply **regularization**, which means they add a penalty to the size of the regression coefficients. This helps reduce overfitting, stabilize the model, and improve prediction accuracy.
+
+-   **Ridge (L2 penalty):**\
+    Ridge regression adds a penalty proportional to the **sum of squared coefficients** in the objective function (in this case, the likelihood function). This method shrinks coefficients toward zero but never forces them to be exactly zero. In logistic regression, this helps handle multicollinearity and produces more stable estimates.\
+    The penalty term is\
+    $$\lambda \sum_j \beta_j^2$$
+
+-   **Lasso (L1 penalty):**\
+    Lasso adds a penalty proportional to the **sum of the absolute values of the coefficients** in the objective function (in this case, the likelihood function). Unlike ridge, lasso can shrink some coefficients **exactly to zero**, effectively performing variable selection inside the logistic regression model.\
+    The penalty term is\
+    $$\lambda \sum_j |\beta_j|$$
+
+Both ridge and lasso use cross-validation to choose the optimal penalty level $\lambda$. A higher $\lambda$ increases the amount of shrinkage, and a lower $\lambda$ makes the model closer to standard logistic regression. In the sections below, I estimate both models using `cv.glmnet()` with 10-fold cross-validation.
+
+```{r}
+#Estimate Ridge + Lasso logit
+model_formula <- as.formula(originated ~ interest_rate + rate_spread + loan_term + 
+                              total_units + combined_loan_to_value_ratio +
+                              lloan + lincome + lproperty_value + income_loan_ratio                               + income_prop_ratio +   rel_income +  age +  
+                              conforming_loan_limit + preapproval_req +
+                              purpose + debt_to_income_ratio  )
+#Define design matrix with all variables for both traiining and testing sets
+X_train <- model.matrix(
+  model_formula,
+  data = train_set
+)[, -1]  # drop intercept column
+
+X_test <- model.matrix(model_formula,
+  data = test_set
+)[, -1]  # drop intercept column
+
+#I also use paralell computing to speed the calculation 
+ridge_model <- cv.glmnet(  x=X_train, y=y_train, family = "binomial",
+                           alpha = 0,         # ridge penalty
+                           weights = w_reg,
+                           type.measure = "auc" ,  # cross-validated AUC
+                           foldid = train_set$fold ,
+                           parallel = TRUE
+)
+
+plot(ridge_model)
+best_lambda_ridge <- ridge_model$lambda.min
+best_lambda_ridge
+coef_ridge <- coef(ridge_model, s = "lambda.min")
+ 
+
+
+lasso_model <- cv.glmnet(  x=X_train, y=y_train, family = "binomial",
+                         alpha = 1,         # ridge penalty
+                         weights = w_reg,
+                         type.measure = "auc",   # cross-validated AUC
+                         foldid = train_set$fold ,
+                         parallel = TRUE
+)
+
+plot(lasso_model)
+best_lambda_lasso <- lasso_model$lambda.min
+best_lambda_lasso
+coef_lasso <- coef(lasso_model, s = "lambda.min")
+```
+
+Both penalized models identify broadly similar core predictors of loan origination but differ in how aggressively they shrink coefficients. **Ridge**, which uses an ℓ₂ penalty, retains *all* predictors and shrinks them smoothly toward zero. Its optimal penalty (λ ≈ 0.00030) yields coefficients that remain close to the baseline logit estimates in both sign and magnitude (e.g., interest_rate and rate_spread remain strongly negative, while variables such as purposeRefinance and preapproval_reqRequested continue to exert substantial negative effects). **Lasso**, using an ℓ₁ penalty, selects a more parsimonious model due to much stronger shrinkage (λ ≈ 6.6e-06). Several debt-to-income indicator variables drop out entirely, suggesting limited predictive value once correlated predictors are jointly considered. The remaining lasso coefficients mirror the baseline model’s direction and relative importance, with particularly strong effects for preapproval_reqRequested, interest_rate, and key age categories.
+
+Comparing across methods, **ridge** maintains stability across all predictors, which is expected given its suitability for handling multicollinearity without enforcing sparsity. **Lasso**, in contrast, performs variable selection: categories of debt-to-income and some age buckets collapse to exactly zero, indicating these effects are not needed for predictive performance once the model regularizes correlated features.
+
+Interestingly, both methods preserve the strongest structural relationships from the baseline logit—large negative effects for interest_rate, rate_spread, and preapproval_reqRequested—suggesting that these signals are robust to penalization. The lasso’s trimmed structure highlights which categorical splines truly matter for classification, while ridge emphasizes consistency and coefficient stability. Together, the models indicate that the baseline logistic specification is not overfitting substantially, but lasso offers a more interpretable subset of predictors without sacrificing predictive discrimination (as indicated by the relatively flat AUC curves near the chosen λ values).
+
+## 6.2 By Intuition.
+
+### 6.2.1 Define the Candidate Specifications.
+
+I prepare several candidate specifications based on economic intuition. The idea is to compare different sets of predictors (in-sample) to determine which combination provides the best balance between predictive accuracy and interpretability, and then to perform a cross validation using the final model. In mortgage underwriting, different groups of variables play distinct roles:
+
+1.  Pricing variables (such as interest rate and rate spread) capture the cost of borrowing;
+
+2.  Borrower income and loan size variables describe repayment capacity; and
+
+3.  Categorical factors, such as loan purpose, age group, or conforming loan status, reflect regulatory constraints and borrower characteristics that lenders may consider.
+
+By constructing separate specifications (full, numeric-only, categorical-only, and loan-term-focused), I can evaluate how each conceptual grouping contributes to predicting loan origination. Contrary to the regularization techniques described before, this model comparison process helps avoid over-fitting and ensures that the final chosen model is grounded in both statistical performance and economic reasoning.
+
+```{r}
+specifications <- list(
+  full              = y_var ~ interest_rate + rate_spread + loan_term +                                   total_units  + combined_loan_to_value_ratio +  
+                      lloan+ lincome +lproperty_value +income_loan_ratio +                                income_prop_ratio + rel_income + age + 
+                      conforming_loan_limit  +  preapproval_req   + purpose  +                            debt_to_income_ratio,
+  
+numeric_only      = y_var ~ interest_rate + rate_spread + loan_term + total_units  +                     combined_loan_to_value_ratio + lloan+ lincome +lproperty_value                      +income_loan_ratio+ income_prop_ratio  
+                    +rel_income,
+categories_only   = y_var ~   age + 
+                    conforming_loan_limit  +  preapproval_req   + purpose  +                            debt_to_income_ratio  ,
+  
+loan_terms_only = y_var ~  interest_rate + rate_spread + loan_term +   total_units   
+)
+
+
+# Cross the dependent variables with specifications
+specifications <- as.data.frame(expand.grid(dependent = "originated", 
+                                            spec_name = names(specifications),
+                                      stringsAsFactors = FALSE ) %>%
+                  mutate(
+                     formula = map2(
+                     spec_name, dependent, ~ {
+                     # Get the formula template
+                     formula_string <- deparse(specifications[[.x]])
+                     # Collapse to a single string
+                     formula_string <- paste(formula_string, collapse = " ")
+                     # Replace `y_var` with the actual dependent variable
+                     formula_string <- sub("y_var", .y, formula_string)
+                     # Convert back to formula
+                     as.formula(formula_string)
+                     })
+                   )
+                  )
+```
+
+### 6.2.2 Estimating Model Specifications.
+
+After defining the set of candidate model specifications, the next step is to estimate each of these models and compare their performance. The code below automates this process by looping through every specification, fitting a logistic regression model, and extracting key diagnostic statistics. By doing this programmatically, I can efficiently evaluate how each variable combination performs in predicting loan origination.
+
+For each model, I collect the regression coefficients, standard errors, in-sample AIC, in-sample accuracy, and in-sample ROC AUC, which allows me to assess both statistical fit and predictive power. This systematic comparison helps identify which specification provides the most informative and robust explanation of loan origination outcomes, balancing interpretability with predictive performance.
+
+```{r}
+
+Models <- specifications  %>%
+  mutate(
+    # Fit a linear model for each formula
+    model = map(formula, ~ glm(.x, data = train_set, weights=w_reg,
+                               family = binomial(link="logit"))),
+    # Tidy the model results
+    tidy_output = map(model, ~ tidy(.x)),
+    #retrieve sample size for power calculations
+    n = map_dbl(model, ~ nobs(.x)), 
+    # Calculate degrees of freedom (DF) for the overall model
+    df = map_dbl(model, ~ nobs(.x) - length(coef(.x))),
+    #Add AIC
+    aic = map_dbl(model, ~ AIC(.x)) ,
+    accuracy = map_dbl(model, ~ {
+      prob <- fitted(.x)
+      pred <- ifelse(prob > 0.5, 1, 0)
+      mean(pred == reg_data$originated)
+    }),
+    # ROC AUC
+    auc = map_dbl(model, ~ {
+      probs <- predict(.x, type = "response")
+      roc_obj <- roc(response = .x$y, predictor = probs)
+      auc(roc_obj)
+    })) %>%
+  unnest(tidy_output)   %>%
+ # select(dependent,spec_name, term, estimate, std.error, statistic, p.value, aic,accuracy,auc ) %>% 
+  arrange(dependent,spec_name)
+
+# Display the regression results
+print(Models)
+```
+
+### 6.2.3 Choose the Final Model.
+
+Before moving to out-of-sample evaluation, I first compare the candidate model specifications using simple in-sample metrics. The goal here is to identify which specification provides the best overall fit according to commonly used statistical criteria. To do this, I extract each model’s **AIC**, **accuracy**, and **AUC**, and summarize them in a compact comparison table. These metrics allow me to rank the specifications based on their explanatory power and predictive performance.
+
+Using the metrics described above, I then select the model with the highest AUC as the “best” in-sample performer and extract both the model object and its formula for later use. Finally, I compute a chi-squared ANOVA test on the best model to assess the joint significance of its predictors.
+
+```{r}
+#keep information criteria and accurancy measures
+in_sample_accuracy <- Models%>% group_by(dependent,spec_name) %>% 
+             summarise(aic          = unique(aic),
+                       accuracy     = unique(accuracy),
+                       auc          = unique(auc))
+
+print(in_sample_accuracy)
+
+best_spec_name <- in_sample_accuracy %>% filter(auc==max(auc)) %>% select(spec_name)
+
+Best       <-  Models %>% filter(spec_name== as.character(best_spec_name)[2])
+
+best_model <- Best[1,]$model[[1]]
+
+best_spec <- specifications[which(specifications$spec_name == 
+                                    as.character(best_spec_name)[2]),]$formula[[1]]
+
+ANOVA_best   <- anova(best_model,  test = 'Chisq')
+
+print(ANOVA_best)
+```
+
+The in-sample AUC metrics indicate clear performance differences across the models. The model with the highest AUC is the *full* model (approximately 0.7), which demonstrates the strongest ability to correctly distinguish between positive and negative outcomes, making it the most reliable classifier in this set. Models with noticeably lower AUC values provide weaker discrimination and are therefore less suitable for prediction in this context.
+
+The ANOVA results further confirm that these differences are statistically significant. The low p-value indicates that the observed variation in AUC in the full model is unlikely to be due to random chance. In other words, at conventional significance levels, we can reject the null hypothesis of equal mean performance and conclude that at least one model’s predictive accuracy is meaningfully different from the others.
+
+I then run a cross validation for the *full* model and compare the out of sample capabilities for the regularization specifications, and this model.
+
+### 6.2.4 K-Fold Cross Validation in Final Model.
+
+Using the *full* specification, I perform a K-fold cross validation using the same folds I used for the ridge and lasso methods. The codes below show each of the stages of the K-fold cross validation process. The procedure can be summarized as:
+
+1.  Split the data into K-Folds
+
+2.  Estimate the model for each K-Fold and Calculate Each Accuracy Measure.
+
+3.  Average Each Performance Measure and Conclude.
+
+The code below implements this procedure
+
+```{r}
+results_cross <- data.frame(fold = 1:kfolds, Threshold=NA, Sensitivity=NA, 
+                            Specificity=NA, Accuracy=NA,  Class_Error=NA,
+                            auc=NA)
+
+models        <- vector("list", kfolds)
+for (i in 1:kfolds) {
+  
+  #1. for each fold i, estimate the model using the data of all folds but i (so i is the test set).
+  Train        <- train_set %>% filter(folds != i )
+  Test         <- train_set %>% filter(folds == i )
+  
+  w_reg_train  <- ifelse(train_set$originated == 1,
+                      class_counts[2]/sum(class_counts),
+                      class_counts[1]/sum(class_counts))
+  #2. Fit logistic regression
+  models[[i]] <- glm(best_spec, data = Train, family = binomial(link="logit"))
+  
+  #Using the estimated model, use the data from fold i to test out of sample predictions and calculate performance measures.
+  
+  performance <- performance_measures(model=models[[i]],y=Test$originated,pred_data=Test)
+    
+  results_cross[i,2:ncol(results_cross)] <- c(as.numeric(performance$comparison["Optimal",]),
+                                              as.numeric(performance$roc$auc))
+}
+
+
+#3. average the chosen performance measures and conclude
+
+average_performance <- results_cross %>% select(-fold) %>%
+                        summarise(across(everything(), mean, na.rm = TRUE))
+print(average_performance)
+```
+
+The cross-validated performance metrics indicate that the model delivers reasonably strong and stable predictive performance across folds. The optimal threshold averages around *0.95*, suggesting the model should only classify an observation as a positive outcome when it is highly confident (given the sample imbalance). At this threshold, the model achieves solid sensitivity, correctly identifying about *84.6%* of positive cases, while specificity is more modest at roughly *50.8%*, implying that nearly half of negative cases are misclassified as positives. Despite this imbalance, overall accuracy remains strong at about *83%*, and the corresponding class error of *16.9%* indicates a relatively low misclassification rate in aggregate.
+
+Moreover, the AUC of approximately *0.71* across the 10 folds shows that the model has moderate discriminative ability: it separates originated from non-originated cases better than chance but still faces overlap in predicted probabilities across classes. Overall, these results that the model generalizes well, prioritizes correctly identifying positive outcomes, and maintains acceptable predictive accuracy in out-of-sample settings.
+
+### 6.3 Comparing Final Results.
+
+As a final step, I evaluate how well the selected specifications perform on **new, unseen data**. A model that fits the training data perfectly may still perform poorly if the model is **over-fit**. I compare the out-of-sample predictive performance of the three methods: (1) the manually selected “best” model based on economic intuition, (2) the Ridge regression model, and (3) the Lasso regression model. Using the `performance_measures` function I defined above, I compute accuracy, sensitivity, specificity, optimal thresholds, and AUC for each model on the test set. The resulting comparison table allows me to identify which modeling strategy generalizes best beyond the sample it was trained on.
+
+```{r}
+#Now compare out of sample for the test set
+out_performance   <- performance_measures(model=best_model,
+                                          y=y_test,pred_data=test_set)
+
+ridge_performance <- performance_measures(model=ridge_model,y=y_test,
+                                          pred_data=X_test) 
+
+lasso_performance <- performance_measures(model=lasso_model,y=y_test,
+                                          pred_data=X_test)
+
+#Compare
+Comparison <- rbind( c(out_performance$comparison["Optimal",], 
+                       out_performance$roc$auc),
+                     
+                     c(ridge_performance$comparison["Optimal",],
+                       ridge_performance$roc$auc),
+                     
+                     c(lasso_performance$comparison["Optimal",],
+                       lasso_performance$roc$auc)
+                     )
+
+rownames(Comparison) <- c("Manual","Ridge","Lasso")
+colnames(Comparison)[ncol(Comparison)] <- "AUC"
+
+print(Comparison)
+```
+
+Across the three models, out-of-sample performance is nearly identical, but the **ridge model shows a very slight edge**, driven primarily by its **highest AUC (0.7044)**, which indicates marginally better ranking ability among the models. Although sensitivity, specificity, and overall accuracy differ only minimally across the Manual, Ridge, and Lasso specifications, the ridge regression achieves the best trade-off by maintaining competitive classification metrics while offering the strongest discrimination power. These differences are small in absolute terms, but the AUC advantage makes ridge the most reliable predictor out of sample.
