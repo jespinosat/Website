@@ -8037,7 +8037,7 @@ strong multicollinearity or other numerical problems.
 <ul>
 <li><strong>Both estimates are unbiased for the true effect (τ = 65), but only the CUPED estimate is precise enough to be useful.</strong> The unadjusted model estimated 36.5 with a 95% CI of [-31.9, 105.0], wide enough that the estimate can land far from the truth and still not be significant. With CUPED, the estimate is <strong>75.1</strong> with a 95% CI of [38.9, 111.4]. That interval also contains the true effect and is now significant. The gap between 36.5 and 75.1 is <strong>sampling noise in the unadjusted estimate</strong>, not a change in what we are measuring.</li>
 <li>The standard error <strong>shrank from 34.9 to 18.5</strong> after applying CUPED, meaning that the same experiment now yields a more precise estimate using the <em>same</em> sample.</li>
-<li>This translates into a <strong>variance reduction of 47%</strong>, equivalent to running the experiment with a substantially larger sample size without collecting a single additional data point.</li>
+<li>This translates into a <strong>standard deviation reduction of 47% (72% of variance)</strong>, equivalent to running the experiment with a substantially larger sample size without collecting a single additional data point.</li>
 </ul>
 <p><strong>Practical implication:</strong> for future experiments on this metric, CUPED lets us either (a) detect smaller effects with the same traffic, or (b) reach the same statistical confidence faster, cutting experiment run-time and opportunity cost.</p>
 </div>
